@@ -1443,9 +1443,17 @@
     renderBudget(data);
   }
 
-  // ---- i18n (re-scan text nodes after each render, reuse th/vn dicts) -----
+  // ---- i18n ------------------------------------------------------------
+  // Two layers, cheapest first:
+  //  1. The curated th/vn dictionaries (hand-translated, defined above) — used whenever
+  //     the sheet still contains the original report copy. Instant, no network call.
+  //  2. A live auto-translate fallback for anything the dictionary doesn't recognize —
+  //     new text typed into the sheet, in ANY language, translated on the fly to
+  //     whichever of TH/EN/VN is selected. Results are cached (in memory and in
+  //     localStorage) so the same text is never translated twice.
+  // If the auto-translate call fails (offline, endpoint down, rate-limited) the original
+  // text is shown as-is rather than breaking the page.
   const dicts = { th, vn };
-  const heroTitleFallback = { en: null };
 
   function collectNodes() {
     const nodes = [];
@@ -1457,16 +1465,95 @@
           ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       }
     });
+    // `en` here just means "the text as originally collected from the sheet/render" —
+    // despite the name it may be in Thai, Vietnamese, or anything else the sheet uses.
     while (walker.nextNode()) nodes.push({ node: walker.currentNode, en: walker.currentNode.nodeValue });
     return nodes;
   }
 
-  function translatedText(original, lang) {
+  // Rough script detector used to decide whether a string already matches the target
+  // language (skip translating it) or needs to be sent through auto-translate.
+  function scriptOf(text) {
+    if (/[฀-๿]/.test(text)) return "th";
+    if (/[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]/i.test(text)) return "vn";
+    return "en";
+  }
+
+  const TRANSLATE_CACHE_KEY = "ptgTranslateCache";
+  const translationCache = new Map();
+  (function loadTranslationCache() {
+    try {
+      const raw = localStorage.getItem(TRANSLATE_CACHE_KEY);
+      if (raw) {
+        const obj = JSON.parse(raw);
+        Object.keys(obj).forEach(k => translationCache.set(k, obj[k]));
+      }
+    } catch (e) { /* corrupt or unavailable cache — start fresh in memory only */ }
+  })();
+  function saveTranslationCache() {
+    try {
+      const obj = {};
+      translationCache.forEach((v, k) => { obj[k] = v; });
+      localStorage.setItem(TRANSLATE_CACHE_KEY, JSON.stringify(obj));
+    } catch (e) { /* storage full/unavailable — cache just won't persist across visits */ }
+  }
+
+  // Runs `fn` over `items` with at most `limit` in flight at once, so translating a
+  // whole page of new text doesn't fire hundreds of simultaneous requests at once.
+  async function mapWithConcurrency(items, limit, fn) {
+    let idx = 0;
+    async function worker() {
+      while (idx < items.length) {
+        const current = idx++;
+        await fn(items[current], current);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  }
+
+  async function resolveTranslation(original, lang) {
     const lead = original.match(/^\s*/)[0];
     const tail = original.match(/\s*$/)[0];
     const key = original.trim().replace(/\s+/g, " ");
-    const table = dicts[lang];
-    return lead + ((table && table[key]) || key) + tail;
+    if (!key) return original;
+    // Nothing translatable in here (numbers, THB amounts, punctuation, emoji) — leave as-is.
+    if (!/[a-zA-Z฀-๿À-ỹ]/.test(key)) return original;
+
+    // Fast path: curated, hand-translated dictionary for the original report copy.
+    if (lang !== "en") {
+      const table = dicts[lang];
+      if (table && table[key]) return lead + table[key] + tail;
+    }
+
+    if (scriptOf(key) === lang) return original; // already in the requested language
+
+    const cacheKey = lang + "::" + key;
+    if (translationCache.has(cacheKey)) return lead + translationCache.get(cacheKey) + tail;
+
+    try {
+      const apiLang = lang === "vn" ? "vi" : lang;
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${apiLang}&dt=t&q=${encodeURIComponent(key)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("translate http " + res.status);
+      const data = await res.json();
+      const translated = (data[0] || []).map(seg => seg[0]).join("");
+      if (!translated) throw new Error("empty translation");
+      translationCache.set(cacheKey, translated);
+      saveTranslationCache();
+      return lead + translated + tail;
+    } catch (err) {
+      console.warn("Auto-translate failed, showing original text:", key, err);
+      return original;
+    }
+  }
+
+  async function translateAll(texts, lang) {
+    const unique = Array.from(new Set(texts));
+    const result = new Map();
+    await mapWithConcurrency(unique, 6, async (text) => {
+      result.set(text, await resolveTranslation(text, lang));
+    });
+    return result;
   }
 
   const titles = {
@@ -1475,22 +1562,24 @@
     vn: "Dự án Insight Người chơi PTG Thái Lan"
   };
   let currentLang = "en";
-  let heroTitleRaw = { en: "", th: "", vn: "" };
+  let heroTitleResolved = { en: "", th: "", vn: "" };
   let cachedNodes = null;
+  let lastLoadedLabel = "";
+  let translateToken = 0; // guards against a stale switch finishing after a newer one
 
   // Must be called once right after each renderAll() and before the next setLanguage()
   // call. Without this, switching languages would re-scan whatever text is currently in
-  // the DOM as if it were "English", so a second switch (e.g. TH -> VN) would try to look
-  // up Thai text in the Vietnamese dictionary and silently fail to translate, and
-  // switching back to EN would not restore the original English text either.
+  // the DOM as if it were the original, so a second switch (e.g. TH -> VN) would try to
+  // translate already-translated Thai text instead of the true original, and switching
+  // back would not restore the real original text either.
   //
   // renderAll() only rewrites the dynamic containers (populated from the sheet); static
   // markup such as the page-nav labels and section headings is untouched by it, so on a
   // refresh triggered while TH/VN is active those static nodes are still showing
   // translated text. Reset any still-connected nodes from the previous cache back to
-  // their known-good English value first, so this re-collection captures true English
-  // for the static parts too (freshly re-rendered dynamic nodes are new DOM nodes that
-  // simply get collected as-is, already in English from renderAll()).
+  // their known-good original value first, so this re-collection captures the true
+  // original for the static parts too (freshly re-rendered dynamic nodes are new DOM
+  // nodes that simply get collected as-is, already original from renderAll()).
   function refreshNodeCache() {
     if (cachedNodes) {
       cachedNodes.forEach(item => {
@@ -1500,14 +1589,11 @@
     cachedNodes = collectNodes();
   }
 
-  function setLanguage(lang) {
+  async function setLanguage(lang) {
     currentLang = lang;
+    const myToken = ++translateToken;
     if (!cachedNodes) refreshNodeCache();
-    cachedNodes.forEach(item => {
-      item.node.nodeValue = lang === "en" ? item.en : translatedText(item.en, lang);
-    });
-    const heroTitle = document.getElementById("heroTitle");
-    if (heroTitle && heroTitleRaw[lang]) heroTitle.innerHTML = heroTitleRaw[lang];
+
     document.documentElement.lang = lang === "vn" ? "vi" : lang;
     document.title = titles[lang] || titles.en;
     document.querySelectorAll(".language-toggle button").forEach(button => {
@@ -1515,29 +1601,39 @@
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", String(active));
     });
+
+    setStatus("Translating…");
+    const translated = await translateAll(cachedNodes.map(item => item.en), lang);
+    if (myToken !== translateToken) return; // a newer language switch already took over
+
+    cachedNodes.forEach(item => {
+      if (item.node.isConnected) item.node.nodeValue = translated.get(item.en);
+    });
+    const heroTitle = document.getElementById("heroTitle");
+    if (heroTitle && heroTitleResolved[lang]) heroTitle.innerHTML = heroTitleResolved[lang];
+    setStatus(lastLoadedLabel);
   }
 
-  function applyHeroTitleTranslations(rawEnHtml) {
-    heroTitleRaw.en = rawEnHtml;
-    // translate the plain-text fragments inside the hero title HTML using the same dicts
-    const tmp = document.createElement("div");
-    tmp.innerHTML = rawEnHtml;
-    ["th", "vn"].forEach(lang => {
-      const clone = tmp.cloneNode(true);
-      clone.childNodes.forEach(walkTranslate);
-      function walkTranslate(n) {
-        if (n.nodeType === 3 && n.nodeValue.trim()) {
-          n.nodeValue = translatedText(n.nodeValue, lang);
-        } else {
-          n.childNodes && n.childNodes.forEach(walkTranslate);
-        }
-      }
-      heroTitleRaw[lang] = clone.innerHTML;
-    });
+  async function computeHeroTitleTranslations(rawHtml) {
+    const results = { en: rawHtml, th: rawHtml, vn: rawHtml };
+    await Promise.all(["en", "th", "vn"].map(async (lang) => {
+      const clone = document.createElement("div");
+      clone.innerHTML = rawHtml;
+      const textNodes = [];
+      (function collect(n) {
+        if (n.nodeType === 3 && n.nodeValue.trim()) textNodes.push(n);
+        else n.childNodes && n.childNodes.forEach(collect);
+      })(clone);
+      await mapWithConcurrency(textNodes, 6, async (node) => {
+        node.nodeValue = await resolveTranslation(node.nodeValue, lang);
+      });
+      results[lang] = clone.innerHTML;
+    }));
+    return results;
   }
 
   document.querySelectorAll(".language-toggle button").forEach(button => {
-    button.addEventListener("click", () => setLanguage(button.dataset.lang));
+    button.addEventListener("click", () => { setLanguage(button.dataset.lang); });
   });
 
   // ---- settings / sheet-id handling ----------------------------------------
@@ -1569,11 +1665,10 @@
     try {
       const data = await fetchAll(sheetId);
       renderAll(data);
-      applyHeroTitleTranslations($("#heroTitle").innerHTML);
+      heroTitleResolved = await computeHeroTitleTranslations($("#heroTitle").innerHTML);
       refreshNodeCache();
-      setLanguage(currentLang);
-      const now = new Date();
-      setStatus(`Last updated ${now.toLocaleTimeString()}`);
+      lastLoadedLabel = `Last updated ${new Date().toLocaleTimeString()}`;
+      await setLanguage(currentLang);
       hideOverlay();
       $("#appShell").classList.add("ready");
       return true;
@@ -1586,9 +1681,15 @@
   }
 
   function init() {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    // A link shared as ...LIVE.html?sheet=SHEET_ID (or ?sheetId=) auto-connects without
+    // making the viewer paste anything — handy once the page is hosted somewhere real
+    // (GitHub Pages, etc.) and shared with teammates who just want to open and read it.
+    const params = new URLSearchParams(location.search);
+    const fromUrl = extractSheetId(params.get("sheet") || params.get("sheetId") || "");
+    const saved = fromUrl || localStorage.getItem(STORAGE_KEY);
     if (saved) {
       $("#sheetIdInput").value = saved;
+      if (fromUrl) localStorage.setItem(STORAGE_KEY, fromUrl);
       loadAndRender(saved);
     } else {
       showOverlay("");
